@@ -1,1 +1,2 @@
 # UnityHDRPBlackHole
+unityのrendering限界を探求するリポジトリです
