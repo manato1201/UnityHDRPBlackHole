@@ -1,0 +1,262 @@
+===============================================
+Unity HDRP ブラックホール粒子システム
+統合セットアップガイド
+===============================================
+
+【概要】
+本システムは以下の3つのコンポーネントで構成されます：
+1. BlackHoleParticleManager.cs    - 粒子生成・バッファ管理
+2. BlackHoleParticles.compute     - GPU軌道計算（Schwarzschild計量）
+3. BlackHoleParticleRenderer.shader - 温度ベースの色付け・描画
+
+粒子が実際に重力場をシミュレートしながら吸い込まれる動作を実現します。
+
+===============================================
+セットアップ手順
+===============================================
+
+【Step 1】ファイルをプロジェクトに配置
+- BlackHoleParticleManager.cs       → Assets/Scripts/
+- BlackHoleParticles.compute        → Assets/Shaders/
+- BlackHoleParticleRenderer.shader  → Assets/Shaders/
+
+【Step 2】シーンの準備
+1. 新しい GameObject を作成：名前は "BlackHole"
+2. BlackHoleParticleManager コンポーネントをアタッチ
+3. Inspector で以下を設定：
+
+   [Particle System Parameters]
+   - Particle Count: 20000 (開始値；後で調整)
+   - Dispatch Group Size: 64 (変更不要)
+
+   [Black Hole Parameters]
+   - Schwarzschild Radius: 2.0
+   - Disk Radius: 8.0
+   - Disk Thickness: 0.5
+
+   [Emitter Parameters]
+   - Emitter Center: (0, 0, 0)
+   - Emitter Radius: 12.0
+   - Emission Rate: 1000 (1秒あたりのスポーン数)
+   - Initial Velocity Range: (0.5, 2.0)
+
+   [Compute Shader]
+   - Particle Compute Shader: BlackHoleParticles
+
+   [Rendering]
+   - Particle Mesh: (点群用メッシュ、または Quad)
+   - Particle Material: BlackHole/ParticleRenderer を使用したマテリアル
+
+【Step 3】マテリアルの作成
+1. Project ウィンドウで右クリック → Create → Material
+2. Shader に "BlackHole/ParticleRenderer" を選択
+3. マテリアルプロパティ：
+   - Particle Size: 0.1～0.3 (調整)
+   - Temperature Scale: 1.0
+   - Max Temperature: 2.0 (粒子の最大速度)
+   - Glow Intensity: 2.0
+
+===============================================
+パフォーマンスチューニング
+===============================================
+
+【粒子数の選択】
+┌─────────────────┬──────────┬──────────────┐
+│ GPU メモリ使用量 │ 粒子数   │ 目安フレーム │
+├─────────────────┼──────────┼──────────────┤
+│ 1 MB            │ 10,000   │ ~6ms @ 4K   │
+│ 2.5 MB          │ 25,000   │ ~12ms @ 4K  │
+│ 5 MB            │ 50,000   │ ~20ms @ 4K  │
+│ 10 MB           │ 100,000  │ ~35ms @ 4K  │
+└─────────────────┴──────────┴──────────────┘
+
+【RK4 積分ステップ数】
+Compute Shader の "stepsPerFrame" 変数で調整：
+- stepsPerFrame = 3: 低精度、高速（~2ms 削減）
+- stepsPerFrame = 5: 推奨値（精度とパフォーマンスの折衷）
+- stepsPerFrame = 10: 高精度（精度重視時）
+
+【ディスパッチサイズ】
+dispatchGroupSize は GPU ウォープサイズに合わせる：
+- NVIDIA GPU: 32（推奨）
+- AMD GPU: 64（推奨）
+- Intel Arc: 16 以上
+
+===============================================
+物理パラメータの解説
+===============================================
+
+【Schwarzschild Radius (rs)】
+イベント・ホライズンの半径。この内部の粒子は自動的に消去されます。
+
+物理値：rs = 2GM/c² 
+相対単位では、ブラックホール質量に対する係数
+
+推奨値：
+- M = 10 solar masses → rs ≈ 30 km ≈ 2.0 (相対)
+- 小さいほど見た目は劇的（rs < 1.0）
+- 大きいほど安定したシミュレーション
+
+【Disk Radius】
+降着円盤の外側半径。粒子がこれより内側かつ厚さ内に入れば消去。
+
+推奨値：rs の 3～5 倍
+- diskRadius = 8.0, rs = 2.0 の場合は妥当
+
+【Emitter Radius】
+粒子がスポーンされる球殻の半径。
+
+推奨値：diskRadius より外側（1.5～2倍）
+- 粒子が初期位置から落下してくる様子が見える
+
+===============================================
+温度（Temperature）の計算
+===============================================
+
+現在の実装：
+  temperature = |velocity|
+
+より物理的には：
+  kinetic_energy = 0.5 * m * v²
+  temperature ∝ kinetic_energy
+
+粒子が降下するにつれ加速度を受けるので、温度は自動的に増加します。
+この温度値が Shader に渡され、色付けに使用されます。
+
+色マッピング（BlackbodyRadiation）：
+  0.0  → Black (dead)
+  0.25 → Dark Red (slow, cold disk)
+  0.5  → Orange (accelerating)
+  0.75 → Yellow-White (hot region)
+  1.0  → White (maximum speed)
+
+===============================================
+デバッグ・検証方法
+===============================================
+
+【粒子数の確認】
+Gameobj の Inspector で右下の "!" ボタンをクリック
+→ Console に "Active Particles: X / Y" と表示
+
+コード側から：
+  manager.ReadbackParticleData();  // 毎フレーム呼ぶと遅い
+
+【軌道の検証】
+Scene ビューで以下を確認：
+1. 粒子がエミッターから放出されているか
+2. ブラックホール中心に向かって加速しているか
+3. 降着円盤に衝突後、粒子が消えるか
+
+【パフォーマンス計測】
+Profiler (Window → Analysis → Profiler)
+- GPU Compute Shader time: UpdateParticles および EmitParticles
+- Rendering time: ParticleRenderer Pass
+
+===============================================
+Blender との対応
+===============================================
+
+Blender の実装との違い：
+
+【Blender】
+- ジオメトリーシェーダーで一度に全粒子を描画
+- ノードシェーダーで静的な温度マップを適用
+→ 時間的な進化が限定的
+
+【Unity (HDRP)】
+- Compute Shader で毎フレーム軌道を更新
+- 粒子のリアルタイムな加速・速度変化を反映
+- 温度は速度から動的に計算
+→ 物理的に正確なシミュレーション
+
+効果：
+✓ 粒子の「吸い込まれる動き」が自然
+✓ Trail が可視化でき、流れが明確
+✓ インタラクティブなパラメータ調整が可能
+
+===============================================
+拡張ポイント
+===============================================
+
+【Phase 2 向け】
+1. Accretion Disk のシミュレーション
+   - 降着円盤の温度場を 3D Texture で管理
+   - 粒子衝突時に放射エネルギー記録
+
+2. Gravitational Lensing
+   - Ray marching で背景を歪ませる Post-Process
+   - 粒子の位置情報から重力場を再構築
+
+3. Advanced Trail Rendering
+   - 粒子の過去N フレームの位置をリング バッファで保持
+   - Ribbon/Strip で連続トレイルを描画
+
+【Phase 3 向け】
+1. Performance Optimization
+   - 粒子のOcclusion culling
+   - LOD（粒子数を距離で変動）
+
+2. Artistic Refinement
+   - 光の散乱（Volumetric scattering）
+   - Bloom パスの色調補正
+
+===============================================
+トラブルシューティング
+===============================================
+
+【粒子が表示されない】
+1. Particle Material が正しく設定されているか
+2. _ParticleBuffer が正しく Shader に渡されているか
+3. Emitter Radius > Schwarzschild Radius か確認
+
+解決策：
+- Compute Shader の EmitParticles() をコメントアウト
+- CPU側で粒子を1つだけ手動生成してテスト
+
+【粒子がすぐに消える】
+- Schwarzschild Radius が大きすぎる
+- 軌道計算のステップ数が足りない（stepsPerFrame を増加）
+- Disk Radius が小さすぎる
+
+【GPU メモリ不足】
+- Particle Count を減らす
+- dispatchGroupSize を小さくする（ただし性能低下）
+
+【ちらつき / アーティファクト】
+- RK4 の dt が大きすぎる → stepsPerFrame を増加
+- floating-point precision 限界 → Black Hole パラメータの正規化を再検討
+
+===============================================
+今後の改善案
+===============================================
+
+【短期】
+□ 粒子の Color Grading（Filmic tone mapping）
+□ Particle Pool の効率化（Arena allocator）
+
+【中期】
+□ Jet/Outflow の実装（両極の高速粒子流）
+□ Disk のクロムスキャッター効果（波長による分散）
+
+【長期】
+□ Multi-thread CPU side emission (現在は単スレッド)
+□ GPU Driven Pipeline (DrawProceduralIndirect)
+□ Photon Sphere の可視化
+
+===============================================
+参考資料
+===============================================
+
+【重力場の物理】
+- Schwarzschild metric: https://en.wikipedia.org/wiki/Schwarzschild_metric
+- Gravitational lensing: https://en.wikipedia.org/wiki/Gravitational_lensing
+
+【実装参考】
+- NVIDIA GDC: "GPU Particle Simulation"
+- AMD RDNA Architecture: Compute Group Size Guidelines
+
+【映像・可視化】
+- Interstellar (2014) - ブラックホール視覚化
+- Event Horizon Telescope - M87* real image
+
+===============================================

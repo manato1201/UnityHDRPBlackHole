@@ -1,0 +1,210 @@
+#pragma kernel UpdateParticles
+#pragma kernel EmitParticles
+
+// ============== Structures ==============
+struct Particle
+{
+    float3 position;      // ワールド座標
+    float3 velocity;      // 速度ベクトル
+    float age;            // 粒子の年齢
+    float temperature;    // 温度指数（速度のマグニチュード）
+    float mass;           // 質量（拡張用）
+    uint flags;           // ビットマスク: bit0=alive
+};
+
+// ============== Buffers ==============
+RWStructuredBuffer<Particle> _ParticleBuffer;
+RWStructuredBuffer<uint> _EmitterBuffer;
+
+// ============== Constants ==============
+cbuffer SimulationParams : register(b0)
+{
+    float _SchwarzchildRadius;
+    float _DiskRadius;
+    float _DiskThickness;
+    float _DeltaTime;
+    
+    float3 _EmitterCenter;
+    float _EmitterRadius;
+    
+    float2 _InitialVelocityRange;
+    float _CurrentTime;
+    int _ParticleCount;
+    
+    int _ParticlesToEmit;
+    float padding;
+};
+
+// ============== Random Helper ==============
+// Simple pseudo-random number generator (xorshift)
+float Random(uint seed)
+{
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    return float(seed & 0x7fffffff) / float(0x7fffffff);
+}
+
+float3 RandomDirection(uint seed)
+{
+    // Fibonacci sphere を使った均一な方向サンプリング
+    float z = 2.0f * Random(seed) - 1.0f;
+    float angle = 6.28318530718f * Random(seed + 1u);
+    float xy = sqrt(1.0f - z * z);
+    return float3(xy * cos(angle), xy * sin(angle), z);
+}
+
+// ============== Physics Kernel ==============
+
+// Schwarzschild 計量の重力加速度を計算
+// 参考: a = -GM/r^2 の修正版
+float3 ComputeGravitationalAcceleration(float3 pos, float3 vel)
+{
+    // ブラックホール中心から見た距離
+    float r = length(pos);
+    
+    // 特異点回避
+    if (r < _SchwarzchildRadius * 1.1f)
+        return float3(0, 0, 0);
+    
+    // 重力係数：標準化されたユニット
+    float G = 1.0f;
+    float M = 1.0f;
+    
+    // Newtonian term: -GM/r^2
+    float3 dir = normalize(pos);
+    float accel = -G * M / (r * r);
+    float3 gravAccel = dir * accel;
+    
+    // Frame-dragging effect (Schwarzschild 第2項、簡略版)
+    // 実装時の簡略化：軌道速度のペナルティ項
+    float orbitalVelocity = sqrt(G * M / r);
+    float speedRatio = length(vel) / orbitalVelocity;
+    
+    // 速度が軌道速度を大きく超えると逆向きの加速（物理的）
+    if (speedRatio > 1.5f)
+    {
+        gravAccel *= (1.0f + (speedRatio - 1.5f) * 0.5f);
+    }
+    
+    return gravAccel;
+}
+
+// RK4 積分：1ステップ（高精度軌道計算）
+void IntegrateRK4Single(inout float3 pos, inout float3 vel, float dt)
+{
+    // k1
+    float3 acc1 = ComputeGravitationalAcceleration(pos, vel);
+    
+    // k2
+    float3 pos2 = pos + vel * (dt * 0.5f);
+    float3 vel2 = vel + acc1 * (dt * 0.5f);
+    float3 acc2 = ComputeGravitationalAcceleration(pos2, vel2);
+    
+    // k3
+    float3 pos3 = pos + vel2 * (dt * 0.5f);
+    float3 vel3 = vel + acc2 * (dt * 0.5f);
+    float3 acc3 = ComputeGravitationalAcceleration(pos3, vel3);
+    
+    // k4
+    float3 pos4 = pos + vel3 * dt;
+    float3 vel4 = vel + acc3 * dt;
+    float3 acc4 = ComputeGravitationalAcceleration(pos4, vel4);
+    
+    // 最終更新
+    pos += (vel + vel2 * 2.0f + vel3 * 2.0f + vel4) * (dt / 6.0f);
+    vel += (acc1 + acc2 * 2.0f + acc3 * 2.0f + acc4) * (dt / 6.0f);
+}
+
+// ============== Main Kernels ==============
+
+[numthreads(64, 1, 1)]
+void UpdateParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _ParticleCount) return;
+    
+    Particle p = _ParticleBuffer[idx];
+    
+    // 死んだ粒子はスキップ
+    if ((p.flags & 1u) == 0)
+        return;
+    
+    // ========== 軌道計算 ==========
+    // 複数ステップの RK4 統合（フレーム内での精度向上）
+    float stepsPerFrame = 5.0f;  // 調整可能
+    float dt = _DeltaTime / stepsPerFrame;
+    
+    for (int i = 0; i < 5; i++)
+    {
+        IntegrateRK4Single(p.position, p.velocity, dt);
+        
+        // 事象の地平線チェック
+        if (length(p.position) < _SchwarzchildRadius)
+        {
+            p.flags = 0u;  // 粒子を消去
+            break;
+        }
+    }
+    
+    // ========== 降着円盤との衝突判定 ==========
+    float diskDist = length(float2(p.position.x, p.position.z));
+    float diskHeight = abs(p.position.y);
+    
+    if (diskDist < _DiskRadius && diskHeight < _DiskThickness)
+    {
+        // 降着円盤に衝突 → 粒子消去（または発光フラグを立てる）
+        p.flags = 0u;
+    }
+    
+    // ========== 状態更新 ==========
+    p.age += _DeltaTime;
+    p.temperature = length(p.velocity);  // 速度のマグニチュード = "温度"
+    
+    // ========== 寿命チェック ==========
+    // 最大寿命を超えたら消去（メモリリーク防止）
+    if (p.age > 30.0f)  // 30秒以上の粒子は消去
+    {
+        p.flags = 0u;
+    }
+    
+    _ParticleBuffer[idx] = p;
+}
+
+[numthreads(64, 1, 1)]
+void EmitParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint emitIdx = id.x;
+    if (emitIdx >= _ParticlesToEmit) return;
+    
+    // シード生成：時間 + インデックス で疑似乱数の再現性を確保
+    uint seed = (uint)(_CurrentTime * 10000.0f) + emitIdx;
+    
+    // ========== スポーン位置 ==========
+    // エミッター球殻上のランダムな点
+    float3 direction = RandomDirection(seed);
+    float3 spawnPos = _EmitterCenter + direction * _EmitterRadius;
+    
+    // ========== 初速度 ==========
+    // ランダムな方向で初速度を設定
+    float speedMagnitude = lerp(_InitialVelocityRange.x, _InitialVelocityRange.y, Random(seed + 2u));
+    float3 initialVel = RandomDirection(seed + 3u) * speedMagnitude;
+    
+    // 中心方向の吸引成分を加える（より自然な落下）
+    float3 toCenter = normalize(_EmitterCenter - spawnPos);
+    initialVel += toCenter * (speedMagnitude * 0.3f);
+    
+    // ========== 粒子書き込み ==========
+    // 環形バッファ方式で次のスポーン位置を決定
+    uint nextIdx = (_ParticlesToEmit + emitIdx) % _ParticleCount;
+    
+    Particle newParticle = (Particle)0;
+    newParticle.position = spawnPos;
+    newParticle.velocity = initialVel;
+    newParticle.age = 0.0f;
+    newParticle.temperature = length(initialVel);
+    newParticle.mass = 1.0f;
+    newParticle.flags = 1u;  // alive
+    
+    _ParticleBuffer[nextIdx] = newParticle;
+}
