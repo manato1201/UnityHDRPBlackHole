@@ -1,0 +1,802 @@
+===============================================
+Compute Shader チューニング完全ガイド
+ブラックホール粒子システム向け
+===============================================
+
+本ドキュメントは以下をカバーします：
+1. RK4 積分の精度 vs パフォーマンス trade-off
+2. GPU メモリアクセスパターンの最適化
+3. 浮動小数点精度の考慮
+4. ディスパッチ戦略（Thread Group サイズ）
+5. 数値安定性（特異点回避）
+
+===============================================
+【Part 1】RK4 積分のチューニング
+===============================================
+
+【現在の実装】
+```hlsl
+void IntegrateRK4Single(inout float3 pos, inout float3 vel, float dt)
+{
+    // k1, k2, k3, k4 を計算して最終更新
+}
+```
+
+フレーム内で複数ステップ実行：
+```hlsl
+for (int i = 0; i < 5; i++)
+{
+    IntegrateRK4Single(p.position, p.velocity, dt);
+}
+```
+
+【パフォーマンス特性】
+
+┌──────────────────┬──────────┬──────────────┬────────────────┐
+│ stepsPerFrame    │ 精度     │ 計算時間     │ 用途           │
+├──────────────────┼──────────┼──────────────┼────────────────┤
+│ 1 (Euler)        │ 低       │ 最小         │ テスト用       │
+│ 2 (RK4)          │ 中       │ ~2ms @ 20k   │ リアルタイム   │
+│ 5 (RK4)          │ 高       │ ~5ms @ 20k   │ 推奨           │
+│ 10+ (RK4)        │ 最高     │ ~10ms @ 20k  │ 精度重視       │
+└──────────────────┴──────────┴──────────────┴────────────────┘
+
+【問題：Adaptive Timestep への対応】
+
+通常の固定ステップは単純ですが、粒子が Event Horizon に近づくと
+誤差が蓄積します。以下は **Adaptive RK4** の実装：
+
+```hlsl
+#define RK4_MAX_ERROR 0.001f
+#define RK4_MIN_DT 0.0001f
+#define RK4_MAX_DT 0.01f
+
+void IntegrateRK4Adaptive(inout float3 pos, inout float3 vel, 
+                          float targetDt, out int stepsTaken)
+{
+    float timeAccum = 0.0f;
+    stepsTaken = 0;
+    
+    while (timeAccum < targetDt && stepsTaken < 20)  // 無限ループ回避
+    {
+        float dt = min(RK4_MAX_DT, targetDt - timeAccum);
+        
+        // フルステップと半ステップ×2 を計算
+        float3 pos_full = pos;
+        float3 vel_full = vel;
+        IntegrateRK4Single(pos_full, vel_full, dt);
+        
+        float3 pos_half = pos;
+        float3 vel_half = vel;
+        IntegrateRK4Single(pos_half, vel_half, dt * 0.5f);
+        IntegrateRK4Single(pos_half, vel_half, dt * 0.5f);
+        
+        // 局所誤差を推定
+        float3 error = abs(pos_full - pos_half);
+        float errorMagnitude = length(error);
+        
+        if (errorMagnitude < RK4_MAX_ERROR)
+        {
+            // ステップを受理
+            pos = pos_full;
+            vel = vel_full;
+            timeAccum += dt;
+        }
+        
+        // 次のステップサイズを調整
+        float scale = pow(RK4_MAX_ERROR / max(errorMagnitude, 1e-6f), 0.2f);
+        dt = clamp(dt * scale, RK4_MIN_DT, RK4_MAX_DT);
+        
+        stepsTaken++;
+    }
+}
+```
+
+【問題】Adaptive Timestep は以下の理由で GPU には向きません：
+- スレッド間の実行時間がバラバラになる（ワープ divergence）
+- ローカルループが増えると GPU 占有率低下
+- Warp synchronization ポイントが増加
+
+**推奨方針**：固定ステップの精度を上げる（5～7ステップ）
+代わりに、特異点接近時に別途チェック
+
+===============================================
+【Part 2】Schwarzschild 計量の数値安定性
+===============================================
+
+【現在の問題点】
+
+```hlsl
+float3 ComputeGravitationalAcceleration(float3 pos, float3 vel)
+{
+    float r = length(pos);
+    
+    // 特異点回避：簡単なクリップ
+    if (r < _SchwarzchildRadius * 1.1f)
+        return float3(0, 0, 0);
+    
+    float accel = -G * M / (r * r);
+    float3 gravAccel = dir * accel;
+    return gravAccel;
+}
+```
+
+**問題**：
+1. r が正確に 0 に近づくとき、normalize(pos) が不安定
+2. r → rs のとき、加速度が無限大に近づく
+3. frame-dragging term が物理的に不正確
+
+【改善版】
+
+```hlsl
+// Schwarzschild 計量の正確な実装
+float3 ComputeGravitationalAccelerationImproved(float3 pos, float3 vel)
+{
+    float r = length(pos);
+    
+    // ========================
+    // 1. Special Region チェック
+    // ========================
+    
+    // Event Horizon 内は加速度 0 (粒子は後で消去される)
+    if (r < _SchwarzchildRadius * 1.05f)
+        return float3(0, 0, 0);
+    
+    // Innermost Stable Circular Orbit (ISCO) 内での安定化
+    // ISCO @ r = 6 GM/c^2 (Schwarzschild case)
+    float ISCO_radius = _SchwarzchildRadius * 3.0f;
+    
+    if (r < ISCO_radius)
+    {
+        // 物理的には粒子は螺旋状に降下
+        // でも数値的には補正が必要
+        r = max(r, _SchwarzchildRadius * 1.2f);
+    }
+    
+    // ========================
+    // 2. 基本的な Newtonian term
+    // ========================
+    float3 dir = pos / (r + 1e-8f);  // 正規化（特異点対策）
+    
+    float G = 1.0f;
+    float M = 1.0f;
+    float accel_newt = -G * M / (r * r);
+    
+    // ========================
+    // 3. General Relativistic 補正
+    //    (Schwarzschild 計量 α, β component)
+    // ========================
+    
+    float rs = _SchwarzchildRadius;
+    
+    // g_00 component: 1 - rs/r
+    // 時間成分の歪み：加速度に乗数を掛ける
+    float metric_correction = 1.0f / (1.0f - rs / r);
+    
+    // 速度の接線成分が軌道速度を超えると相対的に加速度が増加
+    float3 vel_tan = vel - dot(vel, dir) * dir;
+    float speed_tan = length(vel_tan);
+    float orbital_speed = sqrt(abs(accel_newt * r));  // v_orb = sqrt(GM/r)
+    
+    // If 速度が高すぎると、粒子は加速度に逆らって作用力を受ける
+    float speed_ratio = speed_tan / max(orbital_speed, 0.001f);
+    if (speed_ratio > 2.0f)
+    {
+        // 粒子が周回速度の2倍以上 → drag-like effect
+        metric_correction *= (1.0f + (speed_ratio - 2.0f) * 0.3f);
+    }
+    
+    float3 accel_gr = accel_newt * metric_correction * dir;
+    
+    // ========================
+    // 4. Frame-dragging term (Kerr 計量の簡略版)
+    // ========================
+    
+    // Schwarzschild は非回転なので本来なし
+    // でも視覚的リアリティのため、弱い frame-dragging を追加
+    // (物理的には不正確だが、見た目は向上)
+    
+    float angular_momentum = length(cross(pos, vel));
+    float frame_drag_strength = 0.1f * (rs / r) * (rs / r);
+    
+    float3 rotation_axis = normalize(cross(pos, vel));
+    float3 drag_accel = cross(rotation_axis, vel) * frame_drag_strength;
+    
+    // ========================
+    // 5. 最終的な加速度
+    // ========================
+    
+    float3 total_accel = accel_gr + drag_accel;
+    
+    // 数値発散対策：加速度に上限を設ける
+    float accel_magnitude = length(total_accel);
+    if (accel_magnitude > 100.0f)  // 調整可能
+    {
+        total_accel = normalize(total_accel) * 100.0f;
+    }
+    
+    return total_accel;
+}
+```
+
+【問題（続き）：浮動小数点精度】
+
+r が非常に小さい場合（r → rs）、単精度 float では
+差分を正確に計算できません。例：
+
+```
+rs = 2.0
+r = 2.00001f
+1/r - 1/rs = 0.4999975 - 0.5 = -0.0000025f
+
+単精度では最後の桁が落ちる可能性
+```
+
+**対策**：
+
+```hlsl
+// 危険な領域では float64 相当の計算（遅いが正確）
+#ifdef ENABLE_DOUBLE_PRECISION
+// double precision は GPU では遅い (2x～4x)
+// 必要な計算だけに限定
+#endif
+
+// または、Normalized coordinates を使用
+float3 ComputeGravitationalAcceleration_Normalized(float3 r_norm)
+{
+    // r_norm = pos / rs （正規化座標）
+    // この形式なら r_norm ~ 1 の領域で精度が高い
+    
+    float r_n = length(r_norm);
+    
+    // 係数を調整
+    float accel_magnitude = -1.0f / (r_n * r_n);  // rs でのスケーリング済み
+    
+    float3 dir = r_norm / (r_n + 1e-8f);
+    return dir * accel_magnitude;
+}
+```
+
+===============================================
+【Part 3】GPU メモリアクセス最適化
+===============================================
+
+【現在のバッファレイアウト】
+
+```csharp
+[System.Serializable]
+public struct ParticleData
+{
+    public Vector3 position;      // float3 = 12 bytes
+    public Vector3 velocity;      // float3 = 12 bytes
+    public float age;             // float  = 4 bytes
+    public float temperature;     // float  = 4 bytes
+    public float mass;            // float  = 4 bytes
+    public uint flags;            // uint   = 4 bytes
+    // Total: 48 bytes
+};
+```
+
+【問題】：
+- 48 bytes は GPU の cache line (128 bytes) に対して「中途半端」
+- 各スレッドが独立した粒子にアクセス → キャッシュミスが多い
+
+【最適化案 A】Structure of Arrays (SoA)
+
+```hlsl
+// 従来: Array of Structures (AoS)
+RWStructuredBuffer<Particle> particleBuffer;  // [Particle0, Particle1, ...]
+
+// 最適化: Structure of Arrays (SoA)
+RWStructuredBuffer<float3> positions;    // [p0, p1, p2, ...]
+RWStructuredBuffer<float3> velocities;   // [v0, v1, v2, ...]
+RWStructuredBuffer<float> temperatures;  // [t0, t1, t2, ...]
+RWStructuredBuffer<uint> flags;          // [f0, f1, f2, ...]
+```
+
+**利点**：
+- コアレスアクセス (coalesced access) が容易
+- SIMD 効率が向上（全スレッドが position を読む → キャッシュヒット）
+
+**欠点**：
+- C# 側で複数バッファを管理
+- Shader 記述が冗長
+
+【最適化案 B】キャッシュ効率を考慮した AoS
+
+```hlsl
+// アライメントを 16 bytes の倍数に
+[System.Serializable]
+public struct ParticleDataOptimized
+{
+    public Vector3 position;      // 12 bytes (読み出し頻度: 最高)
+    public float temperature;     // 4 bytes
+    // Subtotal: 16 bytes ✓ cache line friendly
+    
+    public Vector3 velocity;      // 12 bytes (読み出し頻度: 中)
+    public float age;             // 4 bytes
+    // Subtotal: 16 bytes ✓
+    
+    public uint flags;            // 4 bytes (読み出し頻度: 低)
+    public float mass;            // 4 bytes
+    public uint _padding0;        // 4 bytes
+    public uint _padding1;        // 4 bytes
+    // Subtotal: 16 bytes ✓
+    
+    // Total: 48 bytes（変わらず）
+    //        但し、アクセスパターンが L1/L2 キャッシュに最適化
+};
+```
+
+【実装例】
+
+```csharp
+// C# 側
+private ComputeBuffer particleBuffer;
+
+private void InitializeBuffers()
+{
+    ParticleDataOptimized[] particles = new ParticleDataOptimized[particleCount];
+    
+    // ... 初期化 ...
+    
+    particleBuffer = new ComputeBuffer(particleCount, Marshal.SizeOf<ParticleDataOptimized>());
+    particleBuffer.SetData(particles);
+}
+
+// Shader 側
+struct Particle
+{
+    float3 position;
+    float temperature;    // 16 bytes block
+    
+    float3 velocity;
+    float age;            // 16 bytes block
+    
+    uint flags;
+    float mass;
+    uint _pad0;
+    uint _pad1;           // 16 bytes block
+};
+
+RWStructuredBuffer<Particle> _ParticleBuffer;
+
+[numthreads(64, 1, 1)]
+void UpdateParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _ParticleCount) return;
+    
+    Particle p = _ParticleBuffer[idx];  // 3×16 bytes = 3回のメモリ読み込み
+    
+    // position と temperature を同時に読む → L1 キャッシュヒット率 ↑
+    float r = length(p.position);
+    float accel_magnitude = 1.0f / (r * r);
+    
+    // ...
+}
+```
+
+【メモリバンド幅の測定】
+
+```hlsl
+// Shader で計算時間を測定
+uint startTime = uint(fmod(_CurrentTime * 1e9, 4294967295.0));
+
+// メモリ操作
+Particle p = _ParticleBuffer[idx];
+
+uint endTime = uint(fmod(_CurrentTime * 1e9, 4294967295.0));
+uint cycleCount = endTime - startTime;
+
+// GPU によっては uint として出力可能
+```
+
+実際には Profiler で測定：
+- Unity Profiler → GPU Profiler
+- NVIDIA nsys / Radeon GPU Profiler
+- AMD uProf
+
+===============================================
+【Part 4】ディスパッチ戦略の最適化
+===============================================
+
+【スレッドグループサイズの選択】
+
+現在の実装：
+```hlsl
+[numthreads(64, 1, 1)]
+void UpdateParticles(uint3 id : SV_DispatchThreadID)
+```
+
+【GPU アーキテクチャ別推奨値】
+
+┌──────────┬──────────┬──────────┬──────────┐
+│ GPU      │ Warp sz. │ 推奨 SG  │ 理由     │
+├──────────┼──────────┼──────────┼──────────┤
+│ NVIDIA   │ 32       │ 32, 64   │ 2 warp  │
+│ AMD      │ 64       │ 64, 128  │ 1-2 WG  │
+│ Intel    │ 16       │ 32, 64   │ 2-4 sg  │
+└──────────┴──────────┴──────────┴──────────┘
+
+【最適なスレッドグループサイズを自動選択】
+
+```csharp
+private int DetermineOptimalThreadGroupSize()
+{
+    // GPU キャパシティを調べる
+    int maxThreadsPerGroup = SystemInfo.maxComputeWorkGroupSize.x;
+    
+    // VRAM 占有率を考慮
+    int particleCount = 20000;
+    int particleStrideBytes = 48;
+    
+    // L1 キャッシュサイズ（GPU によって異なる）
+    // NVIDIA: 96 KB per SM
+    // AMD: 128 KB per CU
+    // Intel: 32 KB per EU
+    
+    int cacheSize = 96 * 1024;  // NVIDIA を仮定
+    
+    // 1 thread group が L1 にフィットするサイズ
+    int maxGroupSizeByCache = cacheSize / particleStrideBytes;
+    
+    // 1 SM あたりの active warps (NVIDIA)
+    // Pascal以降: 32-64 warps per SM
+    int optimalWarpCount = 32;
+    int warpSize = 32;
+    int optimalThreadCount = optimalWarpCount * warpSize;
+    
+    return min(optimalThreadCount, min(maxGroupSizeByCache, maxThreadsPerGroup));
+}
+```
+
+【ディスパッチバランシング】
+
+```csharp
+private void UpdateParticles(float deltaTime)
+{
+    particleComputeShader.SetBuffer(computeKernelID, "_ParticleBuffer", particleBuffer);
+    particleComputeShader.SetFloat("_DeltaTime", deltaTime);
+    
+    // パフォーマンス測定用
+    uint timestampStart = 0, timestampEnd = 0;
+    
+    // ディスパッチ計算
+    int threadGroupSize = 64;  // または上記の関数で決定
+    int groupCountX = Mathf.CeilToInt((float)particleCount / threadGroupSize);
+    
+    // 2D/3D ディスパッチの場合（将来の拡張用）
+    // int groupCountY = Mathf.CeilToInt((float)particleCount / (threadGroupSize * 8));
+    
+    particleComputeShader.Dispatch(computeKernelID, groupCountX, 1, 1);
+}
+```
+
+【ワープダイバージェンスの最小化】
+
+```hlsl
+// ❌ 悪い例：if-else がワープ内で異なる分岐
+[numthreads(64, 1, 1)]
+void BadExample(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    Particle p = _ParticleBuffer[idx];
+    
+    if ((p.flags & 1u) == 0)
+    {
+        // 死んだ粒子の場合：処理をスキップ
+        return;  // ⚠️ ワープの一部だけが戻る → 性能低下
+    }
+    
+    // 生きた粒子の場合：重い計算
+    float3 accel = ComputeGravitationalAcceleration(p.position, p.velocity);
+}
+
+// ✓ 良い例：条件付きで計算（分岐はしない）
+[numthreads(64, 1, 1)]
+void GoodExample(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    Particle p = _ParticleBuffer[idx];
+    
+    // alive flag を乗数として使う
+    float isAlive = float((p.flags & 1u) != 0);
+    
+    // 重い計算は常に実行（ただし結果は使われない）
+    float3 accel = ComputeGravitationalAcceleration(p.position, p.velocity);
+    
+    // 最終更新は isAlive だけで制御
+    p.velocity += accel * isAlive;
+    
+    _ParticleBuffer[idx] = p;
+}
+```
+
+理由：SIMD 実行のため、ワープ内のスレッドは同じ命令を実行する。
+分岐があると、いずれかの分岐を実行し、もう一方は stall。
+
+===============================================
+【Part 5】実装テンプレート：フルチューニング版
+===============================================
+
+```hlsl
+#pragma kernel UpdateParticlesOptimized
+#pragma kernel EmitParticlesOptimized
+
+// ========== Optimized Structures ==========
+
+struct Particle
+{
+    // Block 1: Position & Thermal (16 bytes)
+    float3 position;
+    float temperature;
+    
+    // Block 2: Velocity & Age (16 bytes)
+    float3 velocity;
+    float age;
+    
+    // Block 3: Flags & Mass (16 bytes)
+    uint flags;
+    float mass;
+    uint padding0;
+    uint padding1;
+};
+
+// ========== Optimized Buffers ==========
+
+RWStructuredBuffer<Particle> _ParticleBuffer;
+RWStructuredBuffer<uint> _ParticleCountBuffer;  // 共有メモリ用
+
+// ========== High-Precision Physics ==========
+
+float ComputeGravitationalAccelerationOptimized(float3 pos, float3 vel, 
+                                                float rs, float isco)
+{
+    float r = length(pos);
+    
+    // Early exit for dead particles
+    if (r < rs * 1.05f) return 0.0f;
+    
+    // Clamp to ISCO for stability
+    float r_safe = max(r, isco);
+    
+    // Normalized acceleration
+    float accel = -1.0f / (r_safe * r_safe);
+    
+    // GR correction
+    float correction = 1.0f / (1.0f - rs / r_safe);
+    
+    return accel * correction;
+}
+
+// ========== Adaptive RK4 ==========
+
+void IntegrateRK4OptimizedFixed(inout float3 pos, inout float3 vel, 
+                                float dt, float rs, float isco)
+{
+    float3 k1_v = ComputeGravitationalAccelerationOptimized(pos, vel, rs, isco) * vel;
+    
+    float3 k2_pos = pos + vel * (dt * 0.5f);
+    float3 k2_vel = vel + k1_v * (dt * 0.5f);
+    float3 k2_v = ComputeGravitationalAccelerationOptimized(k2_pos, k2_vel, rs, isco) * k2_vel;
+    
+    float3 k3_pos = pos + k2_vel * (dt * 0.5f);
+    float3 k3_vel = vel + k2_v * (dt * 0.5f);
+    float3 k3_v = ComputeGravitationalAccelerationOptimized(k3_pos, k3_vel, rs, isco) * k3_vel;
+    
+    float3 k4_pos = pos + k3_vel * dt;
+    float3 k4_vel = vel + k3_v * dt;
+    float3 k4_v = ComputeGravitationalAccelerationOptimized(k4_pos, k4_vel, rs, isco) * k4_vel;
+    
+    // Update (weighted average)
+    pos += (vel + k2_vel * 2.0f + k3_vel * 2.0f + k4_vel) * (dt / 6.0f);
+    vel += (k1_v + k2_v * 2.0f + k3_v * 2.0f + k4_v) * (dt / 6.0f);
+}
+
+// ========== Main Kernel ==========
+
+[numthreads(64, 1, 1)]
+void UpdateParticlesOptimized(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint particleCount;
+    uint stride;
+    _ParticleBuffer.GetDimensions(particleCount, stride);
+    
+    if (idx >= particleCount) return;
+    
+    Particle p = _ParticleBuffer[idx];
+    
+    // Early exit for dead particles (branch divergence 最小化)
+    float isAlive = float((p.flags & 1u) != 0);
+    
+    if (isAlive < 0.5f)
+    {
+        // Dead particle: no update needed
+        return;
+    }
+    
+    // ========== Physics Parameters ==========
+    float rs = _SchwarzchildRadius;
+    float isco = rs * 3.0f;
+    float dt = _DeltaTime / 5.0f;  // 5 steps per frame
+    
+    // ========== Integration (5 RK4 steps) ==========
+    for (int step = 0; step < 5; step++)
+    {
+        IntegrateRK4OptimizedFixed(p.position, p.velocity, dt, rs, isco);
+        
+        // ========== Event Horizon Check ==========
+        float r = length(p.position);
+        if (r < rs)
+        {
+            p.flags = 0u;
+            break;
+        }
+    }
+    
+    // ========== Disk Collision ==========
+    float disk_dist = sqrt(p.position.x * p.position.x + p.position.z * p.position.z);
+    float disk_height = abs(p.position.y);
+    
+    float in_disk = float(disk_dist < _DiskRadius && disk_height < _DiskThickness);
+    p.flags = (uint)lerp(float(p.flags), 0.0f, in_disk);
+    
+    // ========== Temperature Update ==========
+    p.temperature = length(p.velocity);
+    
+    // ========== Age & Lifetime Check ==========
+    p.age += _DeltaTime;
+    float lifetime_exceeded = float(p.age > 30.0f);
+    p.flags = (uint)lerp(float(p.flags), 0.0f, lifetime_exceeded);
+    
+    // ========== Write Back ==========
+    _ParticleBuffer[idx] = p;
+}
+
+[numthreads(64, 1, 1)]
+void EmitParticlesOptimized(uint3 id : SV_DispatchThreadID)
+{
+    uint emit_idx = id.x;
+    if (emit_idx >= _ParticlesToEmit) return;
+    
+    // Pseudo-random with seed
+    uint seed = (uint)(_CurrentTime * 10000.0f) + emit_idx;
+    
+    // === Spawn position ===
+    float3 direction = RandomDirection(seed);
+    float3 spawn_pos = _EmitterCenter + direction * _EmitterRadius;
+    
+    // === Initial velocity ===
+    float speed = lerp(_InitialVelocityRange.x, _InitialVelocityRange.y, 
+                       Random(seed + 2u));
+    float3 init_vel = RandomDirection(seed + 3u) * speed;
+    
+    // Add infall component
+    float3 to_center = normalize(_EmitterCenter - spawn_pos);
+    init_vel += to_center * (speed * 0.3f);
+    
+    // === Write to circular buffer ===
+    uint next_idx = (_ParticlesToEmit + emit_idx) % _ParticleCount;
+    
+    Particle new_p = (Particle)0;
+    new_p.position = spawn_pos;
+    new_p.velocity = init_vel;
+    new_p.age = 0.0f;
+    new_p.temperature = length(init_vel);
+    new_p.mass = 1.0f;
+    new_p.flags = 1u;
+    
+    _ParticleBuffer[next_idx] = new_p;
+}
+```
+
+===============================================
+【Part 6】パフォーマンス計測とプロファイリング
+===============================================
+
+【フレームタイム測定】
+
+```csharp
+private System.Diagnostics.Stopwatch gpuTimer = new();
+
+private void ProfileComputeShader()
+{
+    // GPU コマンドをフラッシュ
+    Graphics.WaitForPresentOnGfxThread();
+    
+    gpuTimer.Restart();
+    
+    // 実際のディスパッチ
+    particleComputeShader.Dispatch(computeKernelID, groupCountX, 1, 1);
+    
+    // GPU が完了するまで待機
+    ComputeBuffer.CopyCount(particleBuffer, countBuffer, 0);
+    AsyncGPUReadback.Request(countBuffer, OnCountReadback);
+    
+    gpuTimer.Stop();
+    
+    Debug.Log($"Compute Shader time: {gpuTimer.ElapsedMilliseconds} ms");
+}
+
+private void OnCountReadback(AsyncGPUReadbackRequest request)
+{
+    if (request.hasError)
+    {
+        Debug.LogError("GPU readback failed");
+        return;
+    }
+    
+    var data = request.GetData<int>();
+    Debug.Log($"Active particles: {data[0]}");
+}
+```
+
+【メモリ帯域幅測定】
+
+```csharp
+// 理論値
+// NVIDIA RTX 3070: 576 GB/s
+// AMD RX 6800: 512 GB/s
+
+private void MeasureMemoryBandwidth()
+{
+    int particleCount = 20000;
+    int particleSize = 48;  // bytes
+    
+    // 1フレームで転送されるデータ量
+    long dataTransferPerFrame = particleCount * particleSize;
+    
+    // 計測
+    float fps = 1.0f / Time.deltaTime;
+    long dataTransferPerSecond = (long)(dataTransferPerFrame * fps);
+    
+    float bandwidthGB = dataTransferPerSecond / 1e9f;
+    float utilizationPercent = (bandwidthGB / 576.0f) * 100.0f;  // RTX 3070
+    
+    Debug.Log($"Bandwidth: {bandwidthGB:F2} GB/s ({utilizationPercent:F1}%)");
+}
+```
+
+===============================================
+【Part 7】デバッグとトラブルシューティング
+===============================================
+
+【粒子が爆発的に増加する場合】
+- EmitParticles の circular buffer indexing を確認
+- _ParticlesToEmit が particleCount を超えていないか
+
+【軌道が発散する場合】
+- RK4 ステップ数を増やす（stepsPerFrame = 10 へ）
+- dt が大きすぎないか
+- 特異点チェック (r < rs * 1.05f) が機能しているか
+
+【メモリリーク】
+- age > 30 秒でリセットされているか
+- flags = 0 のリセット処理が実行されているか
+
+診断用シェーダ：
+```hlsl
+[numthreads(64, 1, 1)]
+void DiagnoseParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    Particle p = _ParticleBuffer[idx];
+    
+    // 異常検出
+    bool has_nan = isnan(p.position.x) || isnan(p.velocity.x);
+    bool position_invalid = length(p.position) > 1000.0f;
+    bool velocity_invalid = length(p.velocity) > 100.0f;
+    
+    if (has_nan || position_invalid || velocity_invalid)
+    {
+        // 異常粒子を消去
+        p.flags = 0u;
+    }
+    
+    _ParticleBuffer[idx] = p;
+}
+```
+
+===============================================

@@ -1,0 +1,411 @@
+#pragma kernel UpdateParticles_Simple
+#pragma kernel UpdateParticles_Standard
+#pragma kernel UpdateParticles_HighPrecision
+#pragma kernel EmitParticles
+
+// ========== SHARED STRUCTURES ==========
+
+struct Particle
+{
+    float3 position;
+    float temperature;      // 16 bytes (block 1)
+    
+    float3 velocity;
+    float age;              // 16 bytes (block 2)
+    
+    uint flags;
+    float mass;
+    uint _pad0;
+    uint _pad1;             // 16 bytes (block 3)
+};
+
+struct EmitterState
+{
+    uint nextSpawnIndex;
+    uint emissionCount;
+    uint particleCount;
+    uint padding;
+};
+
+// ========== BUFFERS ==========
+
+RWStructuredBuffer<Particle> _ParticleBuffer;
+RWStructuredBuffer<EmitterState> _EmitterState;
+
+// ========== CONSTANTS ==========
+
+cbuffer PhysicsParams : register(b0)
+{
+    float _SchwarzchildRadius;
+    float _DiskRadius;
+    float _DiskThickness;
+    float _DeltaTime;
+    
+    float3 _EmitterCenter;
+    float _EmitterRadius;
+    
+    float2 _InitialVelocityRange;
+    float _CurrentTime;
+    int _ParticleCount;
+    
+    int _ParticlesToEmit;
+    float _Padding;
+};
+
+// ========== HELPER FUNCTIONS ==========
+
+// Pseudo-random number generator (xorshift32)
+float Random(inout uint seed)
+{
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    return float(seed & 0x7fffffff) / 2147483647.0f;
+}
+
+// Uniformly distributed direction on unit sphere
+float3 RandomDirection(inout uint seed)
+{
+    float z = 2.0f * Random(seed) - 1.0f;
+    float angle = 6.28318530718f * Random(seed);
+    float xy = sqrt(max(0.0f, 1.0f - z * z));
+    return float3(xy * cos(angle), xy * sin(angle), z);
+}
+
+// ============================================================
+// VERSION 1: SIMPLE (High Performance, Low Precision)
+// Euler 積分 + 簡略重力
+// ============================================================
+
+float3 GravAccel_Simple(float3 pos)
+{
+    float r = length(pos);
+    if (r < _SchwarzchildRadius * 1.1f) return float3(0, 0, 0);
+    
+    float accel = -1.0f / (r * r);
+    return normalize(pos) * accel;
+}
+
+[numthreads(64, 1, 1)]
+void UpdateParticles_Simple(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _ParticleCount) return;
+    
+    Particle p = _ParticleBuffer[idx];
+    
+    // Dead particle check (no divergence)
+    float isAlive = float((p.flags & 1u) != 0);
+    
+    // === Physics: Euler Integration (1 step) ===
+    float3 acc = GravAccel_Simple(p.position);
+    p.velocity += acc * _DeltaTime;
+    p.position += p.velocity * _DeltaTime;
+    
+    // === Event Horizon Check ===
+    float r = length(p.position);
+    if (r < _SchwarzchildRadius)
+    {
+        p.flags = 0u;
+    }
+    
+    // === Disk Collision ===
+    float diskDist = sqrt(p.position.x * p.position.x + p.position.z * p.position.z);
+    float diskHeight = abs(p.position.y);
+    if (diskDist < _DiskRadius && diskHeight < _DiskThickness)
+    {
+        p.flags = 0u;
+    }
+    
+    // === State Update ===
+    p.age += _DeltaTime;
+    p.temperature = length(p.velocity);
+    
+    // === Lifetime ===
+    if (p.age > 30.0f)
+    {
+        p.flags = 0u;
+    }
+    
+    _ParticleBuffer[idx] = p;
+}
+
+// ============================================================
+// VERSION 2: STANDARD (Balanced)
+// RK4 積分 (5 steps) + GR補正
+// ============================================================
+
+float3 GravAccel_Standard(float3 pos, float3 vel)
+{
+    float r = length(pos);
+    float rs = _SchwarzchildRadius;
+    
+    // Numerical stability
+    if (r < rs * 1.05f) return float3(0, 0, 0);
+    
+    float isco = rs * 3.0f;
+    r = max(r, isco);
+    
+    // Newtonian term
+    float3 dir = normalize(pos);
+    float accel = -1.0f / (r * r);
+    
+    // GR correction: metric factor
+    float metric = 1.0f / (1.0f - rs / r);
+    
+    return dir * accel * metric;
+}
+
+void RK4Step_Standard(inout float3 pos, inout float3 vel, float dt)
+{
+    // k1
+    float3 a1 = GravAccel_Standard(pos, vel);
+    float3 v1 = vel;
+    
+    // k2
+    float3 a2 = GravAccel_Standard(pos + v1 * (dt * 0.5f), vel + a1 * (dt * 0.5f));
+    float3 v2 = vel + a1 * (dt * 0.5f);
+    
+    // k3
+    float3 a3 = GravAccel_Standard(pos + v2 * (dt * 0.5f), vel + a2 * (dt * 0.5f));
+    float3 v3 = vel + a2 * (dt * 0.5f);
+    
+    // k4
+    float3 a4 = GravAccel_Standard(pos + v3 * dt, vel + a3 * dt);
+    float3 v4 = vel + a3 * dt;
+    
+    // Weighted average
+    pos += (v1 + v2 * 2.0f + v3 * 2.0f + v4) * (dt / 6.0f);
+    vel += (a1 + a2 * 2.0f + a3 * 2.0f + a4) * (dt / 6.0f);
+}
+
+[numthreads(64, 1, 1)]
+void UpdateParticles_Standard(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _ParticleCount) return;
+    
+    Particle p = _ParticleBuffer[idx];
+    
+    float isAlive = float((p.flags & 1u) != 0);
+    
+    // === Physics: RK4 (5 steps per frame) ===
+    float dt = _DeltaTime / 5.0f;
+    
+    for (int step = 0; step < 5; step++)
+    {
+        RK4Step_Standard(p.position, p.velocity, dt);
+        
+        // Early termination if in event horizon
+        if (length(p.position) < _SchwarzchildRadius)
+        {
+            p.flags = 0u;
+            break;
+        }
+    }
+    
+    // === Disk Collision ===
+    float diskDist = sqrt(p.position.x * p.position.x + p.position.z * p.position.z);
+    float diskHeight = abs(p.position.y);
+    if (diskDist < _DiskRadius && diskHeight < _DiskThickness)
+    {
+        p.flags = 0u;
+    }
+    
+    // === State Update ===
+    p.age += _DeltaTime;
+    p.temperature = length(p.velocity);
+    
+    if (p.age > 30.0f)
+    {
+        p.flags = 0u;
+    }
+    
+    _ParticleBuffer[idx] = p;
+}
+
+// ============================================================
+// VERSION 3: HIGH PRECISION
+// Adaptive RK4 + Frame-dragging + Energy conservation check
+// ============================================================
+
+#define ADAPTIVE_MAX_ERROR 0.001f
+#define ADAPTIVE_MIN_DT 0.0001f
+#define ADAPTIVE_MAX_DT 0.01f
+
+float3 GravAccel_HighPrecision(float3 pos, float3 vel)
+{
+    float r = length(pos);
+    float rs = _SchwarzchildRadius;
+    
+    if (r < rs * 1.05f) return float3(0, 0, 0);
+    
+    float isco = rs * 3.0f;
+    r = max(r, isco);
+    
+    // Newtonian
+    float3 dir = normalize(pos);
+    float accel = -1.0f / (r * r);
+    
+    // GR metric correction
+    float metric = 1.0f / (1.0f - rs / r);
+    
+    // Frame-dragging approximation (Kerr-like)
+    float3 L = cross(pos, vel);  // Angular momentum
+    float frame_drag_strength = 0.05f * (rs / r) * (rs / r);
+    float3 omega_cross_v = cross(normalize(L + float3(1e-6, 1e-6, 1e-6)), vel);
+    
+    return dir * accel * metric + omega_cross_v * frame_drag_strength;
+}
+
+void RK4Adaptive(inout float3 pos, inout float3 vel, float targetDt, out int steps_taken)
+{
+    float time_accum = 0.0f;
+    steps_taken = 0;
+    
+    while (time_accum < targetDt && steps_taken < 20)
+    {
+        float dt = min(ADAPTIVE_MAX_DT, targetDt - time_accum);
+        
+        // Full step
+        float3 pos_f = pos, vel_f = vel;
+        float3 a1 = GravAccel_HighPrecision(pos, vel);
+        float3 a2 = GravAccel_HighPrecision(pos + vel * (dt * 0.5f), vel + a1 * (dt * 0.5f));
+        float3 a3 = GravAccel_HighPrecision(pos + (vel + a2 * (dt * 0.5f)) * (dt * 0.5f), vel + a2 * (dt * 0.5f));
+        float3 a4 = GravAccel_HighPrecision(pos + (vel + a3 * dt) * dt, vel + a3 * dt);
+        
+        pos_f += (vel + a1 * 0.5f + a2 + a3) * (dt / 6.0f);
+        vel_f += (a1 + a2 * 2.0f + a3 * 2.0f + a4) * (dt / 6.0f);
+        
+        // Half step × 2
+        float3 pos_h = pos, vel_h = vel;
+        float dt_half = dt * 0.5f;
+        
+        // 1st half step
+        a1 = GravAccel_HighPrecision(pos_h, vel_h);
+        a2 = GravAccel_HighPrecision(pos_h + vel_h * (dt_half * 0.5f), vel_h + a1 * (dt_half * 0.5f));
+        a3 = GravAccel_HighPrecision(pos_h + (vel_h + a2 * (dt_half * 0.5f)) * (dt_half * 0.5f), vel_h + a2 * (dt_half * 0.5f));
+        a4 = GravAccel_HighPrecision(pos_h + (vel_h + a3 * dt_half) * dt_half, vel_h + a3 * dt_half);
+        
+        pos_h += (vel_h + a1 * 0.5f + a2 + a3) * (dt_half / 6.0f);
+        vel_h += (a1 + a2 * 2.0f + a3 * 2.0f + a4) * (dt_half / 6.0f);
+        
+        // 2nd half step
+        a1 = GravAccel_HighPrecision(pos_h, vel_h);
+        a2 = GravAccel_HighPrecision(pos_h + vel_h * (dt_half * 0.5f), vel_h + a1 * (dt_half * 0.5f));
+        a3 = GravAccel_HighPrecision(pos_h + (vel_h + a2 * (dt_half * 0.5f)) * (dt_half * 0.5f), vel_h + a2 * (dt_half * 0.5f));
+        a4 = GravAccel_HighPrecision(pos_h + (vel_h + a3 * dt_half) * dt_half, vel_h + a3 * dt_half);
+        
+        pos_h += (vel_h + a1 * 0.5f + a2 + a3) * (dt_half / 6.0f);
+        vel_h += (a1 + a2 * 2.0f + a3 * 2.0f + a4) * (dt_half / 6.0f);
+        
+        // Error estimate
+        float3 error = pos_f - pos_h;
+        float error_mag = length(error);
+        
+        if (error_mag < ADAPTIVE_MAX_ERROR)
+        {
+            // Accept step
+            pos = pos_f;
+            vel = vel_f;
+            time_accum += dt;
+        }
+        
+        // Adjust timestep
+        float scale = pow(ADAPTIVE_MAX_ERROR / max(error_mag, 1e-6f), 0.2f);
+        dt = clamp(dt * scale, ADAPTIVE_MIN_DT, ADAPTIVE_MAX_DT);
+        
+        steps_taken++;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void UpdateParticles_HighPrecision(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _ParticleCount) return;
+    
+    Particle p = _ParticleBuffer[idx];
+    
+    float isAlive = float((p.flags & 1u) != 0);
+    
+    // === Physics: Adaptive RK4 ===
+    int steps;
+    RK4Adaptive(p.position, p.velocity, _DeltaTime, steps);
+    
+    // === Event Horizon & Stability Checks ===
+    float r = length(p.position);
+    
+    if (r < _SchwarzchildRadius || any(isnan(p.position)))
+    {
+        p.flags = 0u;
+    }
+    
+    // Energy conservation check (diagnostic)
+    float kinetic = length(p.velocity) * length(p.velocity) * 0.5f;
+    float potential = -1.0f / (r + 1e-6f);
+    float total_energy = kinetic + potential;
+    
+    // If energy becomes unphysical, reset
+    if (total_energy > 10.0f || total_energy < -10.0f)
+    {
+        p.flags = 0u;
+    }
+    
+    // === Disk Collision ===
+    float diskDist = sqrt(p.position.x * p.position.x + p.position.z * p.position.z);
+    float diskHeight = abs(p.position.y);
+    if (diskDist < _DiskRadius && diskHeight < _DiskThickness)
+    {
+        p.flags = 0u;
+    }
+    
+    // === State Update ===
+    p.age += _DeltaTime;
+    p.temperature = length(p.velocity);
+    
+    if (p.age > 30.0f)
+    {
+        p.flags = 0u;
+    }
+    
+    _ParticleBuffer[idx] = p;
+}
+
+// ============================================================
+// SHARED EMISSION KERNEL
+// ============================================================
+
+[numthreads(64, 1, 1)]
+void EmitParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint emit_idx = id.x;
+    if (emit_idx >= _ParticlesToEmit) return;
+    
+    uint seed = (uint)(_CurrentTime * 10000.0f) + emit_idx;
+    
+    // Spawn position
+    float3 direction = RandomDirection(seed);
+    float3 spawn_pos = _EmitterCenter + direction * _EmitterRadius;
+    
+    // Initial velocity
+    float speed = lerp(_InitialVelocityRange.x, _InitialVelocityRange.y, Random(seed));
+    float3 init_vel = RandomDirection(seed) * speed;
+    
+    // Infall component
+    float3 to_center = normalize(_EmitterCenter - spawn_pos);
+    init_vel += to_center * (speed * 0.3f);
+    
+    // Circular buffer write
+    uint next_idx = (emit_idx) % _ParticleCount;
+    
+    Particle new_p = (Particle)0;
+    new_p.position = spawn_pos;
+    new_p.velocity = init_vel;
+    new_p.age = 0.0f;
+    new_p.temperature = length(init_vel);
+    new_p.mass = 1.0f;
+    new_p.flags = 1u;
+    
+    _ParticleBuffer[next_idx] = new_p;
+}

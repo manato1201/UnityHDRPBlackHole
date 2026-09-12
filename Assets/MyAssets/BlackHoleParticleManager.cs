@@ -1,61 +1,57 @@
 using UnityEngine;
 using System.Runtime.InteropServices;
+using Unity.Collections;  // ← 追加
 
 /// <summary>
-/// ブラックホール周辺の粒子シミュレーション管理クラス
-/// Compute Shader で粒子軌道を計算し、Transform が不要な GPU駆動型パーティクルシステム
+/// ブラックホール粒子システム - 動作確認版（修正済み）
+/// 最小限の実装で速く動かす
 /// </summary>
 public class BlackHoleParticleManager : MonoBehaviour
 {
     [System.Serializable]
     public struct ParticleData
     {
-        public Vector3 position;      // ワールド座標
-        public Vector3 velocity;      // 速度ベクトル [km/s]
-        public float age;             // 粒子の年齢 [秒]
-        public float temperature;     // 温度指数 (速度から計算される)
-        public float mass;            // 粒子質量（現在は未使用、拡張用）
-        public uint flags;            // ビットマスク: bit0=alive, bit1-31=reserved
+        public Vector3 position;
+        public float temperature;
+
+        public Vector3 velocity;
+        public float age;
+
+        public uint flags;
+        public float mass;
+        public uint _pad0;
+        public uint _pad1;
     }
 
-    [Header("Particle System Parameters")]
+    [Header("Particle System")]
     [SerializeField] private int particleCount = 10000;
     [SerializeField] private int dispatchGroupSize = 64;
-    
-    [Header("Black Hole Parameters")]
-    [SerializeField] private float schwarzschildRadius = 2.0f;  // 事象の地平面半径 [相対単位]
-    [SerializeField] private float diskRadius = 8.0f;           // 降着円盤の外側半径
-    [SerializeField] private float diskThickness = 0.5f;        // 円盤の厚さ
-    
-    [Header("Emitter Parameters")]
+
+    [Header("Black Hole")]
+    [SerializeField] private float schwarzschildRadius = 2.0f;
+    [SerializeField] private float diskRadius = 8.0f;
+    [SerializeField] private float diskThickness = 0.5f;
+
+    [Header("Emitter")]
     [SerializeField] private Vector3 emitterCenter = Vector3.zero;
-    [SerializeField] private float emitterRadius = 12.0f;       // 粒子スポーン範囲
-    [SerializeField] private float emissionRate = 1000f;        // 1秒あたりのスポーン数
+    [SerializeField] private float emitterRadius = 12.0f;
+    [SerializeField] private float emissionRate = 1000f;
     [SerializeField] private Vector2 initialVelocityRange = new Vector2(0.5f, 2.0f);
-    
-    [Header("Compute Shader")]
-    [SerializeField] private ComputeShader particleComputeShader;
-    
-    [Header("Rendering")]
-    [SerializeField] private Mesh particleMesh;  // Point cloud 用メッシュ（頂点1個）
+
+    [Header("Shaders & Materials")]
+    [SerializeField] private ComputeShader computeShader;
     [SerializeField] private Material particleMaterial;
-    [SerializeField] private Material trailMaterial;  // Trail 描画用（オプション）
-    
-    // ============== Internal State ==============
+    [SerializeField] private Mesh particleMesh;
+
+    // ========== Internal ==========
     private ComputeBuffer particleBuffer;
-    private ComputeBuffer particleBufferRead;  // ダブルバッファリング用
     private ComputeBuffer argsBuffer;
-    private ComputeBuffer emitterBuffer;
-    
-    private ParticleData[] particleDataCPU;  // CPU側キャッシュ（デバッグ用）
-    private int computeKernelID;
-    private int emitterKernelID;
-    
+
+    private int updateKernelID;
+    private int emitKernelID;
+
     private float timeSinceLastEmission = 0f;
-    private int aliveParticleCount = 0;
-    
-    // ============== Constants ==============
-    private const int PARTICLE_STRIDE = 48;  // sizeof(ParticleData) = 3*4 + 3*4 + 4 + 4 + 4 + 4 = 48 bytes
+    private const int PARTICLE_STRIDE = 48;
 
     private void OnEnable()
     {
@@ -70,216 +66,171 @@ public class BlackHoleParticleManager : MonoBehaviour
 
     private void InitializeBuffers()
     {
-        // ========== Particle Buffer ==========
-        particleBuffer = new ComputeBuffer(particleCount, PARTICLE_STRIDE, ComputeBufferType.Default);
-        particleBufferRead = new ComputeBuffer(particleCount, PARTICLE_STRIDE, ComputeBufferType.Default);
-        
-        // 初期化：全粒子を "死亡状態" で配置
-        particleDataCPU = new ParticleData[particleCount];
+        Debug.Log("[BlackHole] Initializing particle buffers...");
+
+        // Particle Buffer
+        particleBuffer = new ComputeBuffer(particleCount, PARTICLE_STRIDE);
+
+        ParticleData[] particles = new ParticleData[particleCount];
         for (int i = 0; i < particleCount; i++)
         {
-            particleDataCPU[i] = new ParticleData
+            particles[i] = new ParticleData
             {
                 position = Vector3.zero,
                 velocity = Vector3.zero,
                 age = 0f,
                 temperature = 0f,
                 mass = 1.0f,
-                flags = 0u  // bit0=0 → dead
+                flags = 0u
             };
         }
-        particleBuffer.SetData(particleDataCPU);
-        particleBufferRead.SetData(particleDataCPU);
+        particleBuffer.SetData(particles);
 
-        // ========== Indirect Draw Args Buffer ==========
-        // Mesh.DrawMeshInstancedIndirect 用：[indexCountPerInstance, instanceCount, startIndex, baseVertex, startInstance]
+        // Indirect Draw Args
         uint[] args = new uint[5] { 0, (uint)particleCount, 0, 0, 0 };
         argsBuffer = new ComputeBuffer(1, 5 * sizeof(uint), ComputeBufferType.IndirectArguments);
         argsBuffer.SetData(args);
 
-        // ========== Emitter Control Buffer ==========
-        int[] emitterData = new int[4]
-        {
-            particleCount,        // total capacity
-            0,                     // next spawn index (環形バッファ)
-            0,                     // emission counter
-            0                      // padding
-        };
-        emitterBuffer = new ComputeBuffer(1, 4 * sizeof(int), ComputeBufferType.Default);
-        emitterBuffer.SetData(emitterData);
+        Debug.Log($"[BlackHole] Buffers initialized: {particleCount} particles");
     }
 
     private void SetupComputeShader()
     {
-        if (particleComputeShader == null)
+        if (computeShader == null)
         {
-            Debug.LogError("Particle Compute Shader が未設定です");
+            Debug.LogError("[BlackHole] Compute Shader が設定されていません");
             return;
         }
 
-        // カーネルID の取得
-        computeKernelID = particleComputeShader.FindKernel("UpdateParticles");
-        emitterKernelID = particleComputeShader.FindKernel("EmitParticles");
+        updateKernelID = computeShader.FindKernel("UpdateParticles");
+        emitKernelID = computeShader.FindKernel("EmitParticles");
 
-        // Compute Shader に定数をセット
-        particleComputeShader.SetFloat("_SchwarzchildRadius", schwarzschildRadius);
-        particleComputeShader.SetFloat("_DiskRadius", diskRadius);
-        particleComputeShader.SetFloat("_DiskThickness", diskThickness);
-        particleComputeShader.SetVector("_EmitterCenter", emitterCenter);
-        particleComputeShader.SetFloat("_EmitterRadius", emitterRadius);
-        particleComputeShader.SetVector("_InitialVelocityRange", initialVelocityRange);
-        particleComputeShader.SetInt("_ParticleCount", particleCount);
+        // Constants
+        computeShader.SetFloat("_SchwarzchildRadius", schwarzschildRadius);
+        computeShader.SetFloat("_DiskRadius", diskRadius);
+        computeShader.SetFloat("_DiskThickness", diskThickness);
+        computeShader.SetVector("_EmitterCenter", emitterCenter);
+        computeShader.SetFloat("_EmitterRadius", emitterRadius);
+        computeShader.SetVector("_InitialVelocityRange", initialVelocityRange);
+        computeShader.SetInt("_ParticleCount", particleCount);
+
+        Debug.Log("[BlackHole] Compute Shader setup complete");
     }
 
     private void Update()
     {
-        if (particleBuffer == null) return;
+        if (particleBuffer == null)
+            return;
 
         float deltaTime = Time.deltaTime;
 
-        // ============== Emission Phase ==============
+        // Emission
         EmitParticles(deltaTime);
 
-        // ============== Simulation Phase ==============
+        // Update
         UpdateParticles(deltaTime);
 
-        // ============== Rendering Phase ==============
+        // Rendering
         RenderParticles();
     }
 
     private void EmitParticles(float deltaTime)
     {
-        // スポーン数の計算（deltaTime に比例）
         timeSinceLastEmission += deltaTime;
         int particlesToEmit = (int)(emissionRate * timeSinceLastEmission);
 
-        if (particlesToEmit == 0) return;
+        if (particlesToEmit <= 0)
+            return;
 
         timeSinceLastEmission -= particlesToEmit / emissionRate;
 
-        // Emitter Kernel をセット
-        particleComputeShader.SetBuffer(emitterKernelID, "_ParticleBuffer", particleBuffer);
-        particleComputeShader.SetBuffer(emitterKernelID, "_EmitterBuffer", emitterBuffer);
-        particleComputeShader.SetInt("_ParticlesToEmit", particlesToEmit);
-        particleComputeShader.SetFloat("_Time", Time.time);
+        computeShader.SetBuffer(emitKernelID, "_ParticleBuffer", particleBuffer);
+        computeShader.SetInt("_ParticlesToEmit", particlesToEmit);
+        computeShader.SetFloat("_CurrentTime", Time.time);
 
-        // Dispatch: 1次元で十分
         int groupCount = Mathf.CeilToInt((float)particlesToEmit / dispatchGroupSize);
-        particleComputeShader.Dispatch(emitterKernelID, groupCount, 1, 1);
+        computeShader.Dispatch(emitKernelID, groupCount, 1, 1);
     }
 
     private void UpdateParticles(float deltaTime)
     {
-        // Update Kernel をセット
-        particleComputeShader.SetBuffer(computeKernelID, "_ParticleBuffer", particleBuffer);
-        particleComputeShader.SetFloat("_DeltaTime", deltaTime);
-        particleComputeShader.SetFloat("_CurrentTime", Time.time);
+        computeShader.SetBuffer(updateKernelID, "_ParticleBuffer", particleBuffer);
+        computeShader.SetFloat("_DeltaTime", deltaTime);
+        computeShader.SetFloat("_CurrentTime", Time.time);
 
-        // 全粒子を更新：スレッドグループサイズで割る
         int groupCount = Mathf.CeilToInt((float)particleCount / dispatchGroupSize);
-        particleComputeShader.Dispatch(computeKernelID, groupCount, 1, 1);
+        computeShader.Dispatch(updateKernelID, groupCount, 1, 1);
     }
 
     private void RenderParticles()
     {
-        if (particleMaterial == null) return;
+        if (particleMaterial == null || particleMesh == null)
+            return;
 
-        // Material にバッファを渡す
         particleMaterial.SetBuffer("_ParticleBuffer", particleBuffer);
         particleMaterial.SetInt("_ParticleCount", particleCount);
 
-        // Indirect Draw：GPU が alive 粒子数を数える必要がある場合は別途カウント
-        if (particleMesh != null)
-        {
-            Graphics.DrawMeshInstancedIndirect(
-                particleMesh,
-                0,
-                particleMaterial,
-                new Bounds(emitterCenter, Vector3.one * emitterRadius * 2),
-                argsBuffer
-            );
-        }
-    }
-
-    /// <summary>
-    /// デバッグ用：CPU側に粒子データを読み戻す
-    /// 頻繁に呼ぶと遅いので、検証時のみ使用
-    /// </summary>
-    public void ReadbackParticleData()
-    {
-        if (particleBuffer == null) return;
-
-        AsyncGPUReadback.Request(particleBuffer, (request) =>
-        {
-            if (request.hasError)
-            {
-                Debug.LogError("Particle データ読み戻しエラー");
-                return;
-            }
-
-            var data = request.GetData<ParticleData>();
-            int aliveCount = 0;
-            for (int i = 0; i < data.Length; i++)
-            {
-                if ((data[i].flags & 1u) != 0) aliveCount++;
-            }
-            Debug.Log($"Active Particles: {aliveCount} / {particleCount}");
-        });
-    }
-
-    /// <summary>
-    /// 粒子バッファをクリア
-    /// </summary>
-    public void ClearParticles()
-    {
-        if (particleDataCPU == null) return;
-
-        for (int i = 0; i < particleCount; i++)
-        {
-            particleDataCPU[i].flags = 0;
-        }
-        particleBuffer.SetData(particleDataCPU);
-        timeSinceLastEmission = 0f;
+        Graphics.DrawMeshInstancedIndirect(
+            particleMesh,
+            0,
+            particleMaterial,
+            new Bounds(emitterCenter, Vector3.one * (emitterRadius + schwarzschildRadius) * 2),
+            argsBuffer
+        );
     }
 
     private void ReleaseBuffers()
     {
         particleBuffer?.Release();
-        particleBufferRead?.Release();
         argsBuffer?.Release();
-        emitterBuffer?.Release();
+        Debug.Log("[BlackHole] Buffers released");
     }
 
-    // ============== Inspector から動的に調整可能なメソッド ==============
-
-    public void SetEmissionRate(float rate)
+    // ========== Debugging ==========
+    private void OnGUI()
     {
-        emissionRate = Mathf.Max(0, rate);
-    }
+        GUILayout.BeginArea(new Rect(10, 10, 300, 150));
+        GUILayout.Box("Black Hole Particle System", GUILayout.ExpandWidth(true));
 
-    public void SetInitialVelocity(float minSpeed, float maxSpeed)
-    {
-        initialVelocityRange = new Vector2(Mathf.Max(0, minSpeed), Mathf.Max(minSpeed, maxSpeed));
-        if (particleComputeShader != null)
+        GUILayout.Label($"Particle Count: {particleCount}");
+        GUILayout.Label($"FPS: {1f / Time.deltaTime:F1}");
+        GUILayout.Label($"Frame Time: {Time.deltaTime * 1000:F2} ms");
+
+        if (GUILayout.Button("Clear Particles"))
         {
-            particleComputeShader.SetVector("_InitialVelocityRange", initialVelocityRange);
+            ClearParticles();
         }
-    }
 
-    public void SetBlackHoleParameters(float rs, float diskR, float diskH)
-    {
-        schwarzschildRadius = Mathf.Max(0.1f, rs);
-        diskRadius = Mathf.Max(rs * 2, diskR);
-        diskThickness = Mathf.Max(0.01f, diskH);
-
-        if (particleComputeShader != null)
+        if (GUILayout.Button("Print Debug Info"))
         {
-            particleComputeShader.SetFloat("_SchwarzchildRadius", schwarzschildRadius);
-            particleComputeShader.SetFloat("_DiskRadius", diskRadius);
-            particleComputeShader.SetFloat("_DiskThickness", diskThickness);
+            PrintDebugInfo();
         }
+
+        GUILayout.EndArea();
     }
 
-    public int GetAliveParticleCount() => aliveParticleCount;
-    public int GetTotalParticleCount() => particleCount;
+    private void ClearParticles()
+    {
+        var particles = new ParticleData[particleCount];
+        for (int i = 0; i < particleCount; i++)
+        {
+            particles[i].flags = 0u;
+        }
+        particleBuffer.SetData(particles);
+        timeSinceLastEmission = 0f;
+        Debug.Log("[BlackHole] Particles cleared");
+    }
+
+    private void PrintDebugInfo()
+    {
+        Debug.Log($"=== Black Hole Particle System Debug Info ===");
+        Debug.Log($"Particle Count: {particleCount}");
+        Debug.Log($"Schwarzschild Radius: {schwarzschildRadius}");
+        Debug.Log($"Disk Radius: {diskRadius}");
+        Debug.Log($"Emitter Radius: {emitterRadius}");
+        Debug.Log($"Emission Rate: {emissionRate} /sec");
+        Debug.Log($"Initial Velocity Range: {initialVelocityRange.x} ~ {initialVelocityRange.y}");
+        Debug.Log($"Compute Shader: {computeShader?.name ?? "NOT SET"}");
+        Debug.Log($"Particle Material: {particleMaterial?.name ?? "NOT SET"}");
+    }
 }
